@@ -1,18 +1,16 @@
 
 from __future__ import annotations
 
-import logging
 import time
-
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
-from ..loaders.schemas import ExtractionResult, PageData
 
+import logfire
 import pymupdf
 
+from agentic_rag_e2e.observability import install_auto_tracing
 
-logger = logging.getLogger(__name__)
-
+from .schemas import ExtractionResult, PageData, normalize_metadata
 
 # ---------------------------------------------------------------------
 # PyMuPDF extractor
@@ -51,7 +49,7 @@ def extract_with_pymupdf(
                 f"PDF is password protected: {path}"
             )
 
-        metadata = doc.metadata or {}
+        metadata = normalize_metadata(doc.metadata, format="PDF")
         total_pages = len(doc)
 
         for page_num, page in enumerate(doc, start=1):
@@ -103,7 +101,7 @@ def extract_with_pdfplumber(
     Used as a fallback when PyMuPDF extraction fails.
 
     Note:
-        pdfplumber's word count is not equivalent to PyMuPDF's
+        pdfplumber's text line count is not equivalent to PyMuPDF's
         text block count, so block_count is None.
     """
 
@@ -128,7 +126,7 @@ def extract_with_pdfplumber(
                 "image_count": None,
             })
 
-        metadata = pdf.metadata or {}
+        metadata = normalize_metadata(pdf.metadata, format="PDF")
         total_pages = len(pdf.pages)
 
     return {
@@ -147,7 +145,6 @@ def extract_with_pdfplumber(
 # ---------------------------------------------------------------------
 # Main extraction function with fallback
 # ---------------------------------------------------------------------
-
 def extract_text_from_pdf(
     pdf_path: str | Path,
     count_images: bool = False,
@@ -159,22 +156,16 @@ def extract_text_from_pdf(
 
     Returns an error result if both extraction methods fail.
     """
-
     try:
         return extract_with_pymupdf(
             pdf_path,
             count_images=count_images,
         )
 
-    except Exception as primary_error:
-
-        logger.warning(
-            "PyMuPDF extraction failed for %s: %s",
-            pdf_path,
-            primary_error,
-        )
+    except Exception as primary_error:  # noqa: BLE001 - Parser failures use the error-result contract.
 
         if not use_fallback:
+            logfire.exception("PDF extraction failed; fallback disabled")
             return {
                 "file": str(pdf_path),
                 "error": str(primary_error),
@@ -183,24 +174,23 @@ def extract_text_from_pdf(
                 },
             }
 
+        logfire.warning(
+            "Primary PDF extractor failed; attempting fallback",
+            primary_extractor="pymupdf",
+            fallback_extractor="pdfplumber",
+            error_type=type(primary_error).__name__,
+        )
         try:
             result = extract_with_pdfplumber(pdf_path)
-
             if count_images:
-                logger.warning(
-                    "Image resource counting unavailable "
-                    "in pdfplumber fallback: %s",
-                    pdf_path,
+                logfire.warning(
+                    "Image resource counting unavailable in pdfplumber fallback"
                 )
-
             return result
 
-        except Exception as fallback_error:
+        except Exception as fallback_error:  # noqa: BLE001 - Preserve errors from both parsers.
 
-            logger.exception(
-                "Both PDF extraction methods failed for %s",
-                pdf_path,
-            )
+            logfire.exception("Both PDF extraction methods failed")
 
             return {
                 "file": str(pdf_path),
@@ -210,97 +200,3 @@ def extract_text_from_pdf(
                     "pdfplumber": str(fallback_error),
                 },
             }
-
-
-# ---------------------------------------------------------------------
-# Batch extraction worker
-# ---------------------------------------------------------------------
-
-def _batch_extract_worker(
-    args: tuple[str, bool, bool],
-) -> ExtractionResult:
-    """
-    Worker function for ProcessPoolExecutor.
-
-    Must remain at module level to be picklable.
-    """
-
-    pdf_path, count_images, use_fallback = args
-
-    return extract_text_from_pdf(
-        pdf_path,
-        count_images=count_images,
-        use_fallback=use_fallback,
-    )
-
-
-# ---------------------------------------------------------------------
-# Batch extraction
-# ---------------------------------------------------------------------
-
-def batch_extract(
-    pdf_dir: str | Path,
-    max_workers: int = 4,
-    count_images: bool = False,
-    use_fallback: bool = True,
-) -> list[ExtractionResult]:
-    """
-    Extract all PDFs in a directory concurrently.
-
-    Each worker processes an independent PDF.
-
-    Results preserve the order of input files.
-    """
-
-    directory = Path(pdf_dir)
-
-    if not directory.is_dir():
-        raise NotADirectoryError(
-            f"Directory not found: {directory}"
-        )
-
-    if max_workers < 1:
-        raise ValueError("max_workers must be at least 1")
-
-    pdf_files = sorted(
-        directory.glob("*.pdf"),
-        key=lambda path: path.name.lower(),
-    )
-
-    if not pdf_files:
-        logger.info("No PDF files found in %s", directory)
-        return []
-
-    logger.info(
-        "Starting batch extraction: %d PDFs, %d workers",
-        len(pdf_files),
-        max_workers,
-    )
-
-    worker_args = [
-        (str(path), count_images, use_fallback)
-        for path in pdf_files
-    ]
-
-    with ProcessPoolExecutor(
-        max_workers=max_workers
-    ) as executor:
-
-        results = list(
-            executor.map(
-                _batch_extract_worker,
-                worker_args,
-            )
-        )
-
-    successful = sum(
-        "error" not in result for result in results
-    )
-
-    logger.info(
-        "Batch extraction completed: %d/%d successful",
-        successful,
-        len(results),
-    )
-
-    return results
